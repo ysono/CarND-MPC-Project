@@ -9,7 +9,6 @@ using CppAD::AD;
 // The timestep length and duration
 const size_t solver_N = 25;
 const double solver_dt = 0.05;
-// TODO reasons
 
 // This value assumes the model presented in the classroom is used.
 //

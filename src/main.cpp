@@ -126,15 +126,18 @@ int main() {
           //   could arrive at an erroneous `.end()` (seg fault), or could cause
           //   an infinite loop in pursuit of the `.end()` maybe? I'll worry about
           //   this if multithreading happens.
-          //
-          // Also, this assumes pinging of this server happens at ...
-          // TODO timing
           double steering_value, throttle_value;
           vector<double> mpc_x, mpc_y;
           std::tie(steering_value, throttle_value, mpc_x, mpc_y) = mpc.Solve(
             init_state, coeffs,
             steering_history, throttle_history);
 
+          // For simplicity, replace only one value. This in effect assumes that
+          // the period of the simulation event is less than or equal to `solver_dt`.
+          // But in real life, we may need to swap multiple values if measurements are delayed.
+          // Even if time passed since last event is less than `solver_dt`, we should
+          // still replace one value. Otherwise, empirically, the delay in actuation
+          // produces noticeably wobbly path.
           steering_history.push_back(steering_value);
           steering_history.pop_front();
           throttle_history.push_back(throttle_value);
