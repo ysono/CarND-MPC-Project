@@ -1,7 +1,6 @@
 #ifndef TOOLS_H
 #define TOOLS_H
 
-#include <tuple>
 #include <vector>
 #include "Eigen-3.3/Eigen/Core"
 
