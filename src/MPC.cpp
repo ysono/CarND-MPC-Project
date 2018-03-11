@@ -21,9 +21,11 @@ const double solver_dt = 0.05;
 // presented in the classroom matched the previous radius.
 //
 // This is the length from front to CoG that has a similar radius.
-const double Lf = 2.67;
+const double Lf = 2.67; // miles*sec/hour
 
-const double ref_v = 40; // TODO make it dynamic according to psi.
+const double mps_to_mph = 2.236936; // 1 meter/sec equals this much mile/hour
+const double max_lateral_acc = 1.0 * mps_to_mph; // convert meter/sec/sec to mile/hour/sec
+const double speed_limit = 40; // mile/hour
 
 // The solver takes all the state variables and actuator
 // variables in a singular vector. Thus, we should to establish
@@ -34,11 +36,10 @@ const size_t psi_start = y_start + solver_N;
 const size_t v_start = psi_start + solver_N;
 const size_t cte_start = v_start + solver_N;
 const size_t epsi_start = cte_start + solver_N;
-const size_t delta_start = epsi_start + solver_N;
+const size_t lateral_acc_start = epsi_start + solver_N;
+const size_t delta_start = lateral_acc_start + solver_N;
 const size_t a_start = delta_start + solver_N - 1;
 const size_t n_vars = a_start + solver_N - 1;
-
-const size_t n_constraints_base = delta_start;
 
 AD<double> polyeval_AD(const Eigen::VectorXd & coeffs, const AD<double> & x) {
   AD<double> result = 0.0;
@@ -69,17 +70,25 @@ class FG_eval {
     
     // Express the cost, which is stored is the first element of `fg`.
     fg[0] = 0;
+
+    // Errors of vars that have target values
     for (unsigned int t = 0; t < solver_N; t++) {
       fg[0] += CppAD::pow(vars[cte_start + t], 2);
       fg[0] += CppAD::pow(vars[epsi_start + t], 2);
-      fg[0] += CppAD::pow(vars[v_start + t] - ref_v, 2);
+      fg[0] += 0.1 * CppAD::pow(vars[v_start + t] - speed_limit, 2); // Aside from targeting the speed limit, also prevent coming to a stop.
+      fg[0] += CppAD::pow(vars[lateral_acc_start + t], 2);
     }
     for (unsigned int t = 0; t < solver_N - 1; t++) {
       fg[0] += CppAD::pow(vars[delta_start + t], 2);
       fg[0] += CppAD::pow(vars[a_start + t], 2);
     }
+
+    // Smoothen these values across neighboring timesteps
+    for (unsigned int t = 0; t < solver_N - 1; t++) {
+      fg[0] += 0.1 * CppAD::pow(vars[lateral_acc_start + t + 1] - vars[lateral_acc_start + t], 2);
+    }
     for (unsigned int t = 0; t < solver_N - 2; t++) {
-      fg[0] += 100 * CppAD::pow(vars[delta_start + t + 1] - vars[delta_start + t], 2);
+      fg[0] += 50 * CppAD::pow(vars[delta_start + t + 1] - vars[delta_start + t], 2);
       fg[0] += CppAD::pow(vars[a_start + t + 1] - vars[a_start + t], 2);
     }
 
@@ -87,7 +96,7 @@ class FG_eval {
     //
     // We add 1 to each of the starting indices due to cost being located at index 0 of `fg`.
     // This bumps up the positions of all the other values.
-    //
+
     // The constrained expressions for the initial timestep. Keep these constant while solving.
     fg[1 + x_start] = vars[x_start];
     fg[1 + y_start] = vars[y_start];
@@ -95,16 +104,16 @@ class FG_eval {
     fg[1 + v_start] = vars[v_start];
     fg[1 + cte_start] = vars[cte_start];
     fg[1 + epsi_start] = vars[epsi_start];
-    //
+
     // The constrained expressions for the delayed actuation. Keep these constant while solving.
     for (unsigned int i = 0; i < n_constraints_on_actuation; i++) {
-      unsigned int delta_ind = 1 + n_constraints_base + i;
+      unsigned int delta_ind = 1 + delta_start + i;
       unsigned int a_ind = delta_ind + n_constraints_on_actuation;
 
       fg[delta_ind] = vars[delta_start + i];
       fg[a_ind] = vars[a_start + i];
     }
-    //
+
     // The constrained expressions for the future timesteps. Want to solve these expressions to be closer to zeros.
     for (unsigned int t = 1; t < solver_N; t++) {
       AD<double> x1 = vars[x_start + t];
@@ -113,6 +122,7 @@ class FG_eval {
       AD<double> v1 = vars[v_start + t];
       AD<double> cte1 = vars[cte_start + t];
       AD<double> epsi1 = vars[epsi_start + t];
+      AD<double> lateral_acc1 = vars[lateral_acc_start + t];
 
       AD<double> x0 = vars[x_start + t - 1];
       AD<double> y0 = vars[y_start + t - 1];
@@ -133,6 +143,10 @@ class FG_eval {
       fg[1 + v_start + t] = v1 - (v0 + a0 * solver_dt);
       fg[1 + cte_start + t] = cte1 - ((desired_y0 - y0) + (v0 * CppAD::sin(epsi0) * solver_dt));
       fg[1 + epsi_start + t] = epsi1 - ((psi0 - desired_psi0) + (v0 * delta0 / Lf * solver_dt));
+
+      // Dependent variables. Disabled.
+      // fg[1 + lateral_acc_start + t] = lateral_acc1 - (CppAD::pow(v1, 2) * CppAD::tan(delta0) / Lf);
+      fg[1 + lateral_acc_start + t] = 0;
     }
   }
 };
@@ -152,10 +166,11 @@ MPC::~MPC() {}
  * v0000 ... 00000
  * c0000 ... 00000
  * e0000 ... 00000
+ * l0000 ... 00000
  * ddd00 ... 0000
  * aaa00 ... 0000
  *
- * and constraints as:
+ * and we will have constraints for:
  *
  * x0000 ... 00000
  * y0000 ... 00000
@@ -163,18 +178,35 @@ MPC::~MPC() {}
  * v0000 ... 00000
  * c0000 ... 00000
  * e0000 ... 00000
+ * l0000 ... 00000
  * dddaaa
  *
  * where each column corresponds to a timestep,
  * and `x` to `e` are the six state variables at the initial timestep,
- * and `d` and `a` are the two actuation variables that were commanded earlier but delayed.
+ * and `l` is lateral acceleration,
+ * and `d` and `a` are the two actuation variables that were commanded in the past but delayed.
  *
  * We will express constraints such that:
+ *
  * - In a slot with a non-zero constraint value, the expression is the value itself.
  *   I.e. we want to keep those variables constant.
- * - In a slot with the zero constraint value, the expression is the diff between
- *   the simulated value and the actual value.
- *   I.e. we want to eliminate the diff.
+ * - In a slot with the zero constraint value, the expression is either
+ *   - the diff between the simulated value and the target value, which we want to eliminate
+ *   - a dependent variable expressed in terms of independent variables
+ *
+ * The limits for the vars are:
+ *
+ * ----- ... -----    <=== no limits for x
+ * ----- ... -----    <=== no limits for y
+ * ----- ... -----    <=== no limits for p
+ * vvvvv ... vvvvv    <=== limit v
+ * ----- ... -----    <=== no limits for c
+ * ----- ... -----    <=== no limits for e
+ * lllll ... lllll    <=== limit lateral acceleration
+ * ddddd ... dddd     <=== limit steering
+ * aaaaa ... aaaa     <=== limit acceleration
+ * 
+ * where dash means lack of limit, and non-dash means existence of limit.
  *
  * Out of the solution, we will return the first non-constrained actuation values.
  */
@@ -193,10 +225,20 @@ MPC::Solve(const vector<double> & init_state, const Eigen::VectorXd & coeffs,
   // Lower and upper limits for the independent variables.
   Dvector vars_lowerbound(n_vars);
   Dvector vars_upperbound(n_vars);
-  // Set no limits for measured state vars.
-  for (unsigned int i = 0; i < delta_start; i++) {
+  // Set no limit for most of the state vars.
+  for (unsigned int i = 0; i < lateral_acc_start; i++) {
     vars_lowerbound[i] = -1.0e19;
     vars_upperbound[i] = 1.0e19;
+  }
+  // Limit v by speed limit.
+  for (unsigned int i = v_start; i < cte_start; i++) {
+    vars_lowerbound[i] = -speed_limit; // backward speed
+    vars_upperbound[i] = speed_limit;
+  }
+  // Limit lateral acceleration
+  for (unsigned int i = lateral_acc_start; i < delta_start; i++) {
+    vars_lowerbound[i] = -max_lateral_acc;
+    vars_upperbound[i] = max_lateral_acc;
   }
   // Limit steering to -25 and 25 degrees.
   for (unsigned int i = delta_start; i < a_start; i++) {
@@ -212,7 +254,7 @@ MPC::Solve(const vector<double> & init_state, const Eigen::VectorXd & coeffs,
   // Lower and upper limits for the constraints.
   // For all expressions, both lower and upper limits are set to the same value.
   int n_constraints_on_actuation = steering_history.size(); // O(n)
-  size_t n_constraints = n_constraints_base + n_constraints_on_actuation * 2;
+  size_t n_constraints = delta_start + n_constraints_on_actuation * 2;
   Dvector constraints_lowerbound(n_constraints);
   Dvector constraints_upperbound(n_constraints);
   for (unsigned int i = 0; i < n_constraints; i++) {
@@ -226,6 +268,7 @@ MPC::Solve(const vector<double> & init_state, const Eigen::VectorXd & coeffs,
   vars[v_start] = constraints_lowerbound[v_start] = constraints_upperbound[v_start] = init_state[3];
   vars[cte_start] = constraints_lowerbound[cte_start] = constraints_upperbound[cte_start] = init_state[4];
   vars[epsi_start] = constraints_lowerbound[epsi_start] = constraints_upperbound[epsi_start] = init_state[5];
+  vars[lateral_acc_start] = constraints_lowerbound[lateral_acc_start] = constraints_upperbound[lateral_acc_start] = init_state[6];
 
   // Set delayed actuation values to vars and constraints.
   unsigned int i = 0;
@@ -237,15 +280,12 @@ MPC::Solve(const vector<double> & init_state, const Eigen::VectorXd & coeffs,
       a_iter != throttle_history.cend();
     delta_iter++, a_iter++, i++) {
 
-    unsigned int constr_delta_ind = n_constraints_base + i;
-    unsigned int constr_a_ind = constr_delta_ind + n_constraints_on_actuation;
+    unsigned int delta_ind = delta_start + i;
+    unsigned int vars_a_ind = a_start + i;
+    unsigned int constr_a_ind = delta_ind + n_constraints_on_actuation;
 
-    vars[delta_start + i] =
-      constraints_lowerbound[constr_delta_ind] =
-      constraints_upperbound[constr_delta_ind] = *delta_iter;
-    vars[a_start + i] =
-      constraints_lowerbound[constr_a_ind] =
-      constraints_upperbound[constr_a_ind] = *a_iter;
+    vars[delta_ind] = constraints_lowerbound[delta_ind] = constraints_upperbound[delta_ind] = *delta_iter;
+    vars[vars_a_ind] = constraints_lowerbound[constr_a_ind] = constraints_upperbound[constr_a_ind] = *a_iter;
   }
 
   // object that computes objective and constraints

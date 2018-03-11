@@ -113,7 +113,8 @@ int main() {
           double cte = coeffs[0]; // no need for polyeval
           double epsi = -atan(coeffs[1]);
 
-          vector<double> init_state{0, 0, 0, v, cte, epsi};
+          // In the car's coordinate system, it is at origin pointing to x axis.
+          vector<double> init_state{0, 0, 0, v, cte, epsi, 0};
 
           // Calculate steering angle and throttle using MPC.
           // Both are in between [-1, 1].
@@ -125,20 +126,23 @@ int main() {
           //   could arrive at an erroneous `.end()` (seg fault), or could cause
           //   an infinite loop in pursuit of the `.end()` maybe? I'll worry about
           //   this if multithreading happens.
-          double last_steering_value, last_throttle_value;
+          //
+          // Also, this assumes pinging of this server happens at ...
+          // TODO timing
+          double steering_value, throttle_value;
           vector<double> mpc_x, mpc_y;
-          std::tie(last_steering_value, last_throttle_value, mpc_x, mpc_y) = mpc.Solve(
+          std::tie(steering_value, throttle_value, mpc_x, mpc_y) = mpc.Solve(
             init_state, coeffs,
             steering_history, throttle_history);
 
-          steering_history.push_back(last_steering_value);
+          steering_history.push_back(steering_value);
           steering_history.pop_front();
-          throttle_history.push_back(last_throttle_value);
+          throttle_history.push_back(throttle_value);
           throttle_history.pop_front();
 
           json msgJson;
-          msgJson["steering_angle"] = -last_steering_value; // udacity simulator takes positive values for right turn
-          msgJson["throttle"] = last_throttle_value;
+          msgJson["steering_angle"] = -steering_value; // udacity simulator takes positive values for right turn
+          msgJson["throttle"] = throttle_value;
 
           //Display the MPC predicted trajectory. Displayed in green line.
           msgJson["mpc_x"] = mpc_x;
