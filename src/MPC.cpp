@@ -7,8 +7,8 @@ using std::vector;
 using CppAD::AD;
 
 // The timestep length and duration
-const size_t solver_N = 25;
-const double solver_dt = 0.05;
+const size_t solver_N = 22;
+const double solver_dt = 0.06;
 
 // This value assumes the model presented in the classroom is used.
 //
@@ -22,9 +22,20 @@ const double solver_dt = 0.05;
 // This is the length from front to CoG that has a similar radius.
 const double Lf = 2.67; // miles*sec/hour
 
-const double mps_to_mph = 2.236936; // 1 meter/sec equals this much mile/hour
-const double max_lateral_acc = 1.0 * mps_to_mph; // convert meter/sec/sec to mile/hour/sec
-const double speed_limit = 40; // mile/hour
+const double max_delta = 0.436332;
+const double max_acc = 1.0;
+
+// approximation. abs() of these variables are expected to be < these respective values 95% of the time.
+const double std_cte = 4.0;
+const double std_epsi = M_PI / 4;
+const double std_ddelta_dt = max_delta / 4;
+const double std_dacc_dt = max_acc / 2;
+
+// const double mps_to_mph = 2.236936; // 1 meter/sec equals this much mile/hour
+// const double max_lateral_acc = 1.0 * mps_to_mph; // convert meter/sec/sec to mile/hour/sec
+const double max_lateral_acc = 60; // tried to determine analytically, as above, but empirically 30 to 60 looks like a reasonable limit.
+const double speed_limit = 50; // mile/hour
+const double optimal_speed_at_max_turn = 30;
 
 // The solver takes all the state variables and actuator
 // variables in a singular vector. Thus, we should to establish
@@ -70,25 +81,28 @@ class FG_eval {
     // Express the cost, which is stored is the first element of `fg`.
     fg[0] = 0;
 
-    // Errors of vars that have target values
     for (unsigned int t = 0; t < solver_N; t++) {
-      fg[0] += CppAD::pow(vars[cte_start + t], 2);
-      fg[0] += CppAD::pow(vars[epsi_start + t], 2);
-      fg[0] += 0.1 * CppAD::pow(vars[v_start + t] - speed_limit, 2); // Aside from targeting the speed limit, also prevent coming to a stop.
-      fg[0] += CppAD::pow(vars[lateral_acc_start + t], 2);
+      fg[0] += 50 * (solver_N - t) * CppAD::pow(vars[cte_start + t] / std_cte, 2);
+      fg[0] += 2 * CppAD::pow(vars[epsi_start + t] / std_epsi, 2);
+      fg[0] += 60 * CppAD::pow((vars[v_start + t] - speed_limit) / speed_limit, 2); // Aside from targeting the speed limit, also prevent coming to a stop.
+      // fg[0] += 0.001 * CppAD::pow(vars[lateral_acc_start + t] / max_lateral_acc, 2);
     }
     for (unsigned int t = 0; t < solver_N - 1; t++) {
-      fg[0] += CppAD::pow(vars[delta_start + t], 2);
-      fg[0] += CppAD::pow(vars[a_start + t], 2);
-    }
+      fg[0] += 5 * CppAD::pow(vars[delta_start + t] / max_delta, 2);
+      fg[0] += 1 * CppAD::pow(vars[a_start + t] / max_acc, 2);
 
-    // Smoothen these values across neighboring timesteps
-    for (unsigned int t = 0; t < solver_N - 1; t++) {
-      fg[0] += 0.1 * CppAD::pow(vars[lateral_acc_start + t + 1] - vars[lateral_acc_start + t], 2);
+      // Reduce correlation wide steering and large speed.
+      // Take square of steering in order to ignore sign.
+      double relative_importance_of_speed = 3;
+      fg[0] += 20 *
+        CppAD::pow(vars[delta_start + t] / max_delta, 2) *
+        CppAD::pow(vars[v_start + t + 1] / optimal_speed_at_max_turn * relative_importance_of_speed, 2);
+
+      // fg[0] += 0.1 * CppAD::pow((vars[lateral_acc_start + t + 1] - vars[lateral_acc_start + t]) / max_lateral_acc, 2);
     }
     for (unsigned int t = 0; t < solver_N - 2; t++) {
-      fg[0] += 50 * CppAD::pow(vars[delta_start + t + 1] - vars[delta_start + t], 2);
-      fg[0] += CppAD::pow(vars[a_start + t + 1] - vars[a_start + t], 2);
+      fg[0] += 7 * CppAD::pow((vars[delta_start + t + 1] - vars[delta_start + t]) / std_ddelta_dt, 2);
+      fg[0] += 1 * CppAD::pow((vars[a_start + t + 1] - vars[a_start + t]) / std_dacc_dt, 2);
     }
 
     // Express constraints
@@ -143,9 +157,9 @@ class FG_eval {
       fg[1 + cte_start + t] = cte1 - ((desired_y0 - y0) + (v0 * CppAD::sin(epsi0) * solver_dt));
       fg[1 + epsi_start + t] = epsi1 - ((psi0 - desired_psi0) + (v0 * delta0 / Lf * solver_dt));
 
-      // Dependent variables. Disabled.
+      // Lateral acceleration is in mile/hour/sec.
       // fg[1 + lateral_acc_start + t] = lateral_acc1 - (CppAD::pow(v1, 2) * CppAD::tan(delta0) / Lf);
-      fg[1 + lateral_acc_start + t] = 0;
+      fg[1 + lateral_acc_start + t] = 0; // Not using for cost after all, so skip calculation.
     }
   }
 };
@@ -241,13 +255,13 @@ MPC::Solve(const vector<double> & init_state, const Eigen::VectorXd & coeffs,
   }
   // Limit steering to -25 and 25 degrees.
   for (unsigned int i = delta_start; i < a_start; i++) {
-    vars_lowerbound[i] = -0.436332;
-    vars_upperbound[i] = 0.436332;
+    vars_lowerbound[i] = -max_delta;
+    vars_upperbound[i] = max_delta;
   }
   // Limit acceleration to -1 and 1 m/s.
   for (unsigned int i = a_start; i < n_vars; i++) {
-    vars_lowerbound[i] = -1.0;
-    vars_upperbound[i] = 1.0;
+    vars_lowerbound[i] = -max_acc;
+    vars_upperbound[i] = max_acc;
   }
 
   // Lower and upper limits for the constraints.

@@ -3,6 +3,12 @@ Self-Driving Car Engineer Nanodegree Program
 
 ---
 
+## Project writeup
+
+Here is a snippet of the result: [video](https://youtu.be/YpHUly3JZuQ).
+
+For explanation of work that led to the final solution, please see [doc/PROJECT_WRITEUP.md](doc/PROJECT_WRITEUP.md).
+
 ## Dependencies
 
 * cmake >= 3.5
