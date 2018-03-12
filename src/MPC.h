@@ -6,8 +6,9 @@
 #include <vector>
 #include "Eigen-3.3/Eigen/Core"
 
-extern const size_t solver_N;
-extern const double solver_dt;
+extern const double Lf;
+
+const double mps_to_mph = 2.236936; // 1 meter/sec equals this much mile/hour
 
 class MPC {
  public:
@@ -23,8 +24,7 @@ class MPC {
   //   y values of the optimal simulated trajectory
   // )
   std::tuple<double, double, std::vector<double>, std::vector<double>>
-  Solve(const std::vector<double> & init_state, const Eigen::VectorXd & coeffs,
-        const std::list<double> & steering_history, const std::list<double> & throttle_history);
+  Solve(const std::vector<double> & init_state, const Eigen::VectorXd & coeffs);
 };
 
 #endif /* MPC_H */

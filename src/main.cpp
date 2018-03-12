@@ -2,7 +2,6 @@
 #include <uWS/uWS.h>
 #include <chrono>
 #include <iostream>
-#include <list>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -65,25 +64,16 @@ int main() {
   MPC mpc;
 
   int actuation_delay_ms = 100;
-  double history_s = actuation_delay_ms / 1000.0;
-  // Assert that the solver has enough time resolution.
-  assert(history_s > solver_dt);
-  // Assert that the solver's future outlook is long enough. Pad by an arbitrary factor.
-  assert(solver_dt * solver_N > history_s * 5);
-  size_t history_size = std::ceil(history_s / solver_dt);
+  double actuation_delay_s = actuation_delay_ms / 1000.0;
 
-  std::cout << "Remembering " << history_size << " past actuations" << std::endl;
-
-  std::list<double> steering_history;
-  std::list<double> throttle_history;
-  for (unsigned int i = 0; i < history_size; i++) {
-    // In the simulation, vehicle starts with 0 steering and 0 throttle.
-    steering_history.push_back(0.0);
-    throttle_history.push_back(0.0);
-  }
+  // In the simulation, vehicle starts with 0 steering and 0 throttle.
+  double last_steering = 0;
+  double last_throttle = 0;
+  std::time_t last_actuation_time = std::time(0);
+  bool did_print_actuation_warning = false;
 
   h.onMessage(
-    [&mpc, &actuation_delay_ms, &steering_history, &throttle_history]
+    [&mpc, &actuation_delay_ms, &actuation_delay_s, &last_steering, &last_throttle, &last_actuation_time, &did_print_actuation_warning]
     (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length, uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -100,52 +90,47 @@ int main() {
           vector<double> ptsy = j[1]["ptsy"];
           double px = j[1]["x"];
           double py = j[1]["y"];
-          double psi = j[1]["psi"];
-          double v = j[1]["speed"];
+          double psi = j[1]["psi"]; // radian
+          double v = j[1]["speed"]; // mile/hour
+          v /= mps_to_mph; // meter/sec
 
-          // transform the global coordinate to car's coordinate
+          // transform the global coordinate to car's coordinate system
           MatrixXd pts_wrt_car = translate_then_rotate(ptsx, ptsy, -px, -py, -psi);
           VectorXd ptsx_wrt_car = pts_wrt_car.row(0);
           VectorXd ptsy_wrt_car = pts_wrt_car.row(1);
 
           VectorXd coeffs = polyfit(ptsx_wrt_car, ptsy_wrt_car, 3);
 
+          // In the car's coordinate system, the car is at origin and pointing to x axis.
+          px = py = psi = 0;
+
           double cte = coeffs[0]; // no need for polyeval
           double epsi = -atan(coeffs[1]);
 
-          // In the car's coordinate system, it is at origin pointing to x axis.
-          vector<double> init_state{0, 0, 0, v, cte, epsi, 0};
+          // helpers for the global kinetic model below. cos and sin are simplified away.
+          double delayed_x_term = v /** cos(psi)*/ * actuation_delay_s;
+          double delayed_y_term = 0; // v * sin(psi) * actuation_delay_s;
+          double delayed_psi_term = v / Lf * last_steering * actuation_delay_s;
+
+          // global kinetic model for the actuation delay
+          double px_delayed = px + delayed_x_term;
+          double py_delayed = py + delayed_y_term;
+          double psi_delayed = psi + delayed_psi_term;
+          double v_delayed = v + last_throttle * actuation_delay_s;
+          double cte_delayed = cte + delayed_y_term;
+          double epsi_delayed = epsi + delayed_psi_term;
+
+          vector<double> init_state{
+            px_delayed, py_delayed, psi_delayed, v_delayed, cte_delayed, epsi_delayed};
 
           // Calculate steering angle and throttle using MPC.
           // Both are in between [-1, 1].
-          //
-          // If multithreading, multiple lambdas can update history.
-          // - Ordering would not be guaranteed, but this is fine for use with solver
-          //   as long as it's not wildly out of order
-          // - Not sure how std::list is implemented, but traversing the lists
-          //   could arrive at an erroneous `.end()` (seg fault), or could cause
-          //   an infinite loop in pursuit of the `.end()` maybe? I'll worry about
-          //   this if multithreading happens.
-          double steering_value, throttle_value;
           vector<double> mpc_x, mpc_y;
-          std::tie(steering_value, throttle_value, mpc_x, mpc_y) = mpc.Solve(
-            init_state, coeffs,
-            steering_history, throttle_history);
-
-          // For simplicity, replace only one value. This in effect assumes that
-          // the period of the simulation event is less than or equal to `solver_dt`.
-          // But in real life, we may need to swap multiple values if measurements are delayed.
-          // Even if time passed since last event is less than `solver_dt`, we should
-          // still replace one value. Otherwise, empirically, the delay in actuation
-          // produces noticeably wobbly path.
-          steering_history.push_back(steering_value);
-          steering_history.pop_front();
-          throttle_history.push_back(throttle_value);
-          throttle_history.pop_front();
+          std::tie(last_steering, last_throttle, mpc_x, mpc_y) = mpc.Solve(init_state, coeffs);
 
           json msgJson;
-          msgJson["steering_angle"] = -steering_value; // udacity simulator takes positive values for right turn
-          msgJson["throttle"] = throttle_value;
+          msgJson["steering_angle"] = -last_steering; // udacity simulator takes positive values for right turn
+          msgJson["throttle"] = last_throttle;
 
           //Display the MPC predicted trajectory. Displayed in green line.
           msgJson["mpc_x"] = mpc_x;
@@ -167,6 +152,27 @@ int main() {
           // SUBMITTING.
           std::this_thread::sleep_for(std::chrono::milliseconds(actuation_delay_ms));
           ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+
+          if (!did_print_actuation_warning) {
+            std::time_t now = std::time(0);
+            if (std::difftime(now, last_actuation_time) < actuation_delay_s) {
+              // There has been more than one actuation commanded within
+              // `actuation_delay_s` seconds ago and now. However, we earlier
+              // estimated the state in the future off by `actuation_delay_s`
+              // seconds using only one set of actuation value. This is inaccurate.
+              // Hence the actuation value commanded at the present time is likely
+              // not optimal.
+              // If we see this message too many times, we have to change the code
+              // to remember multiple sets of actuation values in the past, and
+              // run multi-timestep global kinetic model estimation.
+              std::cerr << "WARNING: our assumption about actuation delay may be inaccurate." << std::endl;
+
+              // If this condition is true, then it should be true for every
+              // simulator event, so shush it.
+              did_print_actuation_warning = true;
+            }
+            last_actuation_time = now;
+          }
         }
       } else {
         // Manual driving
@@ -190,14 +196,12 @@ int main() {
     }
   });
 
-  h.onConnection([/*&history_scheduler*/](uWS::WebSocket<uWS::SERVER> ws, uWS::HttpRequest req) {
+  h.onConnection([](uWS::WebSocket<uWS::SERVER> ws, uWS::HttpRequest req) {
     std::cout << "Connected!!!" << std::endl;
-    // history_scheduler.detach();
   });
 
-  h.onDisconnection([/*&history_scheduler*/](uWS::WebSocket<uWS::SERVER> ws, int code,
+  h.onDisconnection([](uWS::WebSocket<uWS::SERVER> ws, int code,
                          char *message, size_t length) {
-    // history_scheduler.join();
     ws.close();
     std::cout << "Disconnected" << std::endl;
   });
