@@ -26,9 +26,25 @@ Since we are fitting the trajectory to a polynomial, the path needs to be unique
 
 Also, the larger the epsi, the more cte differs from the actual closest distance between the trajectory and the car at the origin. For example, in an extreme case, if the trajectory is almost perpendicular to x but passes near the origin, the cte might register as a very large value, even though the actual distance between the origin and the line is small. To remedy this, maybe it might be better to fit a first-order polynomial to the trajectory and use it as the x axis?
 
-#### Calculating the actuation delay inside the solver
+#### Estimating the actuation delay
 
-I previously attempted estimating the actuation delay within the solver. The solver would receive the initial state at the present, not the estimated future state after actuation delay. The solver would hard constrain not only the first timestep of the state vars, but also one or more first timesteps of the actuation vars. These actuation vars would be contrained to one or more historical actuation values. This is technically possible, but is not practical due to code complexity; nor is it accurate unless it so happens that the dt time resolution does not alias the actuation delay, i.e. it's accurate if actuation delay is approximately an integer times dt. This approach is preserved in git branch `ysono/actuation-delay-inside-solver`, but has been removed.
+##### Inside the solver
+
+I previously attempted estimating the actuation delay within the solver. The solver would receive the initial state at the present, not the estimated future state after actuation delay. The solver would hard constrain not only the first timestep of the state vars, but also one or more first timesteps of the actuation vars. These actuation vars would be contrained to one or more historical actuation values. This is technically possible, but is not practical due to code complexity; nor is it accurate unless it so happens that the dt time resolution does not alias the actuation delay, i.e. it's accurate if actuation delay is approximately an integer times dt. This approach is preserved in git branch `ysono/actuation-delay-inside-solver`.
+
+##### Outside the solver, over multiple timsteps
+
+Instead of using one set of actuation values to estimate the consequence of the actuation delay, it should be more accurate to use multiple actuations that happened in the past. My implementation was not successful, however.
+
+For example, if there were actuations 40ms, 90ms, and 115ms ago, all those values would be used.
+
+A simple approach is to average each actuation variable within the last 100ms, and run global kinematic model once. You can activate this strategy this with `./mpc avg`. The result looks slightly better.
+
+A more expensive approach is to iterate the global kinematic model over every past interval between actuations: i.e. use the actuation 115ms ago for (100 - 90 = 10ms), use the actuation 90ms ago for the next (90 - 40 = 50ms), and use the actuation 40ms ago for 40ms. You can activate this strategy with `./mpc interative`. The result, however, is a *more* pronounced delay, not less. There is something wrong with my implementation.
+
+`./mpc` without arguments runs with solver with the one previously stored actuation values.
+
+Note to the reviewer, if the code is hard to follow, simplified code that supports the case of `strategy == one` only is available at an older git branch `ysono/actuation-delay-one`.
 
 #### An attempt to manage curves more intelligently
 

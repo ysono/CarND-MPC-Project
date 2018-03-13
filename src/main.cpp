@@ -2,6 +2,7 @@
 #include <uWS/uWS.h>
 #include <chrono>
 #include <iostream>
+#include <list>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -12,6 +13,7 @@
 #include "json.hpp"
 #include "tools.h"
 
+using std::list;
 using std::string;
 using std::vector;
 using Eigen::MatrixXd;
@@ -57,7 +59,22 @@ Eigen::VectorXd polyfit(const Eigen::VectorXd & xvals, const Eigen::VectorXd & y
   return result;
 }
 
-int main() {
+enum actuation_delay_strategy {
+  one,
+  avg,
+  iterative
+};
+
+int main(int argc, char* argv[]) {
+  actuation_delay_strategy strategy;
+  if (argc >= 2 && strcmp(argv[1], "avg") == 0) {
+    strategy = avg;
+  } else if (argc >= 2 && strcmp(argv[1], "iterative") == 0) {
+    strategy = iterative;
+  } else {
+    strategy = one;
+  }
+
   uWS::Hub h;
 
   // MPC is initialized here!
@@ -69,11 +86,17 @@ int main() {
   // In the simulation, vehicle starts with 0 steering and 0 throttle.
   double last_steering = 0;
   double last_throttle = 0;
-  std::time_t last_actuation_time = std::time(0);
-  bool did_print_actuation_warning = false;
+
+  // List of tuples of (steering, throttle, timestamp).
+  // Newer items will be pushed to the front, not back.
+  list<std::tuple<double, double, std::time_t>> actuation_history =
+    {std::make_tuple(last_steering, last_throttle, std::time(0))};
 
   h.onMessage(
-    [&mpc, &actuation_delay_ms, &actuation_delay_s, &last_steering, &last_throttle, &last_actuation_time, &did_print_actuation_warning]
+    [&mpc, &actuation_delay_ms, &actuation_delay_s,
+      &strategy,
+      &last_steering, &last_throttle,
+      &actuation_history]
     (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length, uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -101,30 +124,106 @@ int main() {
 
           VectorXd coeffs = polyfit(ptsx_wrt_car, ptsy_wrt_car, 3);
 
-          // In the car's coordinate system, the car is at origin and pointing to x axis.
+          // Update and add state vars in the car's coordinate system
           px = py = psi = 0;
-
-          double cte = coeffs[0]; // no need for polyeval
+          double cte = coeffs[0];
           double epsi = -atan(coeffs[1]);
 
-          // helpers for the global kinetic model below. cos and sin are simplified away.
-          double delayed_x_term = v /** cos(psi)*/ * actuation_delay_s;
-          double delayed_y_term = 0; // v * sin(psi) * actuation_delay_s;
-          double delayed_psi_term = v / Lf * last_steering * actuation_delay_s;
+          // Now, determine the init state to pass to the solver.
 
-          // global kinetic model for the actuation delay
-          double px_delayed = px + delayed_x_term;
-          double py_delayed = py + delayed_y_term;
-          double psi_delayed = psi + delayed_psi_term;
-          double v_delayed = v + last_throttle * actuation_delay_s;
-          double cte_delayed = cte + delayed_y_term;
-          double epsi_delayed = epsi + delayed_psi_term;
+          double aggregated_steering = 0; // used by `one` and `avg` strategies only
+          double aggregated_throttle = 0; // ditto
 
-          vector<double> init_state{
-            px_delayed, py_delayed, psi_delayed, v_delayed, cte_delayed, epsi_delayed};
+          auto history_iter = actuation_history.begin(); // used by `avg` and `iterative` strategies only
+          auto history_purge_iter = history_iter; // ditto
+
+          std::time_t now = std::time(0);
+
+          if (strategy == one) {
+            aggregated_steering = last_steering;
+            aggregated_throttle = last_throttle;
+          } else {
+            int actuation_i = 0;
+            double aggregated_steering = 0;
+            double aggregated_throttle = 0;
+
+            // Determine the newest actuation that is older than the actuation delay.
+            // If there is none older than the actuation delay, then choose the oldest in history.
+            for(; history_iter != actuation_history.end(); history_iter++) {
+              double steering, throttle;
+              std::time_t ts;
+              std::tie(steering, throttle, ts) = *history_iter;
+
+              actuation_i++;
+              aggregated_steering += steering;
+              aggregated_throttle += throttle;
+
+              double age = std::difftime(now, ts); // how long ago from the present this actuation was
+              if (age > actuation_delay_s) {
+                break;
+              }
+            }
+            if (history_iter == actuation_history.end()) {
+              // Business logic guarantees the list has at least one item, so this is safe.
+              std::advance(history_iter, -1);
+            }
+
+            // save for purging, to be done later
+            history_purge_iter = history_iter;
+
+            if (strategy == avg) {
+              aggregated_steering /= actuation_i;
+              aggregated_throttle /= actuation_i;
+            }
+          }
+
+          vector<double> init_state; // the init state to the pass to the solver.
+
+          if (strategy == one || strategy == avg) {
+            // helpers for the global kinetic model below. cos and sin are simplified away.
+            double delayed_x_term = v /** cos(psi)*/ * actuation_delay_s;
+            double delayed_y_term = 0; // v * sin(psi) * actuation_delay_s;
+            double delayed_psi_term = v / Lf * aggregated_steering * actuation_delay_s;
+
+            // global kinetic model for the actuation delay
+            double px_delayed = px + delayed_x_term;
+            double py_delayed = py + delayed_y_term;
+            double psi_delayed = psi + delayed_psi_term;
+            double v_delayed = v + aggregated_throttle * actuation_delay_s;
+            double cte_delayed = cte + delayed_y_term;
+            double epsi_delayed = epsi + delayed_psi_term;
+
+            init_state = {px_delayed, py_delayed, psi_delayed, v_delayed, cte_delayed, epsi_delayed};
+          } else {
+            init_state = {px, py, psi, v, cte, epsi};
+
+            // Iteratively update the states using global kinetic model to estimate
+            // what the state will likely look like after actuation delay from the present.
+            for(; history_iter != actuation_history.begin(); history_iter--) {
+              double steering, throttle;
+              std::time_t earlier_ts;
+              std::tie(steering, throttle, earlier_ts) = *history_iter;
+
+              double earlier_age = std::difftime(now, earlier_ts);
+              earlier_age = std::min(earlier_age, actuation_delay_s); // cap by actuation delay
+
+              double later_age;
+              if (history_iter == actuation_history.begin()) {
+                later_age = 0;
+              } else {
+                double _0, _1;
+                std::time_t later_ts;
+                std::tie(_0, _1, later_ts) = *(std::prev(history_iter, 1));
+                later_age = std::difftime(now, later_ts);
+              }
+
+              double dt = earlier_age - later_age;
+
+              init_state = global_kinetic_model(init_state, steering, throttle, dt, Lf);
+            }
+          }
 
           // Calculate steering angle and throttle using MPC.
-          // Both are in between [-1, 1].
           vector<double> mpc_x, mpc_y;
           std::tie(last_steering, last_throttle, mpc_x, mpc_y) = mpc.Solve(init_state, coeffs);
 
@@ -141,38 +240,32 @@ int main() {
           msgJson["next_y"] = eigen_to_std_vector(ptsy_wrt_car);
 
           auto msg = "42[\"steer\"," + msgJson.dump() + "]";
-          // Latency
-          // The purpose is to mimic real driving conditions where
-          // the car does actuate the commands instantly.
-          //
-          // Feel free to play around with this value but should be to drive
-          // around the track with 100ms latency.
-          //
-          // NOTE: REMEMBER TO SET THIS TO 100 MILLISECONDS BEFORE
-          // SUBMITTING.
-          std::this_thread::sleep_for(std::chrono::milliseconds(actuation_delay_ms));
-          ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+          
+          // capture the time of actuation (just before the artificically introduced latency)
+          now = std::time(0);
 
-          if (!did_print_actuation_warning) {
-            std::time_t now = std::time(0);
-            if (std::difftime(now, last_actuation_time) < actuation_delay_s) {
-              // There has been more than one actuation commanded within
-              // `actuation_delay_s` seconds ago and now. However, we earlier
-              // estimated the state in the future off by `actuation_delay_s`
-              // seconds using only one set of actuation value. This is inaccurate.
-              // Hence the actuation value commanded at the present time is likely
-              // not optimal.
-              // If we see this message too many times, we have to change the code
-              // to remember multiple sets of actuation values in the past, and
-              // run multi-timestep global kinetic model estimation.
-              std::cerr << "WARNING: our assumption about actuation delay may be inaccurate." << std::endl;
+          auto response_thread = std::thread([&ws, &msg, &actuation_delay_ms]() {
+            // Latency
+            // The purpose is to mimic real driving conditions where
+            // the car does actuate the commands instantly.
+            //
+            // Feel free to play around with this value but should be to drive
+            // around the track with 100ms latency.
+            //
+            // NOTE: REMEMBER TO SET THIS TO 100 MILLISECONDS BEFORE
+            // SUBMITTING.
+            std::this_thread::sleep_for(std::chrono::milliseconds(actuation_delay_ms));
+            ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+          });
 
-              // If this condition is true, then it should be true for every
-              // simulator event, so shush it.
-              did_print_actuation_warning = true;
-            }
-            last_actuation_time = now;
+          if (strategy == avg || strategy == iterative) {
+            // after actuation is executed, do cleanup
+            // Here we push_back an item, keeping the size of the list at least one.
+            actuation_history.push_front(std::make_tuple(last_steering, last_throttle, now));
+            actuation_history.erase(history_purge_iter, actuation_history.end());
           }
+
+          response_thread.join();
         }
       } else {
         // Manual driving
